@@ -1,0 +1,30 @@
+# Checkpoints and generated outputs
+checkpoints/
+outputs/
+log/
+wandb/
+
+# Python/runtime cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Large local packages
+*.whl
+
+# Datasets and rollout state
+datasets/*.parquet
+datasets/*.rollout_state/
+datasets/*.summary.json
+
+# Experiment process state
+*.pid
+*.lock
+*_DONE
+*_FAILED
+
+# Generated evaluation summaries
+pass16_*SUMMARY*
+pass16_*COMPARISON*
+pass16_*state*

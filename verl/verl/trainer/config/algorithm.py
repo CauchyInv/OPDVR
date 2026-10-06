@@ -358,3 +358,8 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    # Optional student-prefix / teacher-suffix recipe; validated only when enabled.
+    teacher_takeover: dict[str, Any] = field(default_factory=dict)
+    # Optional probe-and-reweight recipe; mutually exclusive with teacher_takeover
+    # and validated only when enabled.
+    disturbed_opd: dict[str, Any] = field(default_factory=dict)

@@ -174,6 +174,12 @@ class RolloutConfig(BaseConfig):
     engine_kwargs: dict = field(default_factory=dict)
 
     calculate_log_probs: bool = False
+    # Engine seed for training rollouts. vllm_rollout_spmd already reads
+    # config.get("seed", 0) and passes it to LLM(), but the field was never
+    # declared here, so overriding it raised TypeError on config instantiation.
+    # Declaring it with the same default keeps existing runs bit-identical while
+    # making seed replicates possible.
+    seed: int = 0
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 

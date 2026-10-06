@@ -77,6 +77,177 @@ algorithm:
   # Advantage estimator type: "gae", "grpo", "reinforce_plus_plus", etc.
   adv_estimator: gae
 
+  # Opt-in mixed-trajectory OPD; legacy baseline behavior is unchanged when disabled.
+  teacher_takeover:
+
+    # Leave all legacy baseline paths unchanged unless explicitly enabled.
+    enabled: false
+
+    # all_opd | success_opd | prefix_opd_suffix_sft
+    loss_mode: all_opd
+
+    # fixed | cosine; fractions refer to the actual nonterminal student response.
+    schedule: cosine
+
+    # Used by the fixed schedule, including the debug entry point.
+    fixed_prefix_ratio: 0.5
+
+    # Student-generated fraction at the start of the cosine curriculum.
+    prefix_start: 0.25
+
+    # At 1.0, skip continuation and train only the original OPD branch.
+    prefix_end: 1.0
+
+    # Fraction of planned optimizer updates used to reach prefix_end.
+    anneal_fraction: 0.8
+
+    # Independently normalized original-trajectory objective coefficient.
+    original_weight: 0.5
+
+    # Independently normalized mixed-trajectory objective coefficient.
+    mixed_weight: 0.5
+
+    # Within-mixed coefficient for prefix OPD in the split mode.
+    prefix_opd_weight: 0.5
+
+    # Within-mixed coefficient for successful-suffix raw-logit SFT.
+    suffix_sft_weight: 0.5
+
+    # Generation temperature, distinct from rollout.teacher_temperature for scoring.
+    teacher_temperature: 0.6
+
+    # Teacher suffix nucleus sampling cutoff.
+    teacher_top_p: 1.0
+
+    # The teacher engine runs after the student engine sleeps, on the same GPUs.
+    teacher_gpu_memory_utilization: 0.65
+
+    # Initial continuation engine concurrency (one local OOM retry halves it).
+    teacher_max_num_seqs: 64
+
+    # Teacher prefill/decode token budget; does not change response length.
+    teacher_max_num_batched_tokens: 32768
+
+    # Enable only for small bring-up tests; production uses compiled execution.
+    teacher_enforce_eager: false
+
+    # Engine seed; each rank adds its rank, without per-request seed fallback.
+    teacher_seed: 20260921
+
+    # Bounded private IPC wait, with 30-second liveness messages.
+    teacher_timeout_seconds: 3600
+
+    # Null means trainer.default_local_dir/takeover; must resolve under /data.
+    rollout_data_dir: null
+
+    # Secondary audit only; primary correctness gating retains the DAPO scorer.
+    audit_prime_math: true
+
+  # Opt-in probe-and-reweight OPD; mutually exclusive with teacher_takeover.
+  # Legacy baseline behavior is unchanged when disabled.
+  disturbed_opd:
+
+    # reweight | real_repair | adam_budget | distribution_repair | sign_hybrid
+    method: reweight
+    repair_norm_fraction: 0.2
+    repair_tolerance: 1.0e-4
+    repair_huber: 0.1
+    repair_adv_cap: 1.0
+    adam_progress_fraction: 0.9
+    teacher_topk: 32
+    distribution_coef: 0.2
+    audit_every: 10
+    # Empty disables the expensive per-token mechanism audit.  When enabled,
+    # every DP rank writes one Zstd-Parquet shard per optimization step.
+    audit_dir: ""
+    audit_post_update: false
+    audit_topk: 2
+    # When positive, retain the fixed teacher's top-K distribution solely for
+    # a top-K+tail forward-KL audit; sampled-token OPD remains unchanged.
+    audit_distribution_kl_topk: 0
+    audit_eos_token_id: 151643
+
+    # Leave all legacy baseline paths unchanged unless explicitly enabled.
+    enabled: false
+
+    # A = log(1 - alpha + alpha * exp(teacher - student)); alpha=1 reproduces
+    # the baseline token_reward_direct reward exactly.
+    alpha: 1.0
+
+    # Probe step size. Must clear bf16 quantization yet stay in the linear
+    # regime; calibrate over {3e-5, 1e-4, 3e-4, 1e-3}.
+    eta_probe: 1.0e-4
+
+    # Fraction of the batch's first-order gain spent rescuing opposed tokens.
+    # kappa=0 collapses weights to 1 and must reproduce the baseline curve.
+    kappa: 0.0
+
+    # Upper bound on a single token's weight before mean-1 renormalization.
+    w_max: 5.0
+
+    # Exclude this lowest quantile of |A| from selection; threshold comes from
+    # an all-reduced histogram so every rank agrees.
+    a_min_quantile: 0.2
+
+    # probe | random | stratified_random | entropy. stratified_random exactly
+    # matches probe counts by sign(A), log-|A| bucket, and position quartile.
+    select: probe
+
+    # both | up | down; "both" is the original V = {A * Delta < 0} definition.
+    direction: both
+
+    # mean_one: normalize w to global mean 1. Boosting V then attenuates every
+    #   other token by 1/(1 + V_frac * lambda); at the measured V_frac ~= 0.27
+    #   that halved the majority's learning signal.
+    # budget:   non-V weights stay exactly 1.0 and lambda is capped so total
+    #   gradient mass grows by at most mass_growth_budget.
+    # continuous_budget: same mask/budget, but selected extra weights scale
+    #   with robustly normalized opposed Delta-log-p magnitude.
+    weight_mode: mean_one
+
+    # Maximum fractional growth of total gradient mass under weight_mode=budget.
+    mass_growth_budget: 0.2
+
+    # Scale the opposite disturbed sign set after applying the primary budget
+    # weights. 1.0 is the legacy no-op; 0.0 masks that set from the loss.
+    opposite_weight_scale: 1.0
+
+    # continuous_budget severity normalization.
+    continuous_floor: 0.25
+    continuous_quantile: 0.9
+    # delta | surrogate | rank | topq. See disturbed_opd.py for the exact
+    # severity and mapping definitions.
+    continuous_score_mode: delta
+    # Strict control: preserve mask and score multiset within
+    # sign(A)-by-|A|-by-position strata, but shuffle score-token assignments.
+    continuous_shuffle: false
+    continuous_rank_power: 1.0
+    continuous_top_fraction: 0.5
+
+    # false: probe this batch's raw gradient (the original formulation). With
+    #   beta1=0.9 the real Adam step is ~90% determined by earlier batches, so
+    #   that direction is not the one the optimizer takes.
+    # true:  probe the bias-corrected first moment, i.e. the real Adam direction
+    #   scaled by eta_probe/lr.
+    probe_momentum: false
+
+    # The probe is decay-free by construction; weight decay is data independent.
+    probe_weight_decay: false
+
+    # Probe several eta values and both directions on identical parameters and
+    # report V overlap, then update with the configured probe.
+    probe_diagnostic: false
+
+    # Resolution and range of the global |A| histogram.
+    quantile_bins: 2048
+    quantile_max: 32.0
+
+    # Seed for the random selector ablation only.
+    random_seed: 20260924
+
+    # Number of log-|A| strata for the strict stratified-random control.
+    stratified_bins: 16
+
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 

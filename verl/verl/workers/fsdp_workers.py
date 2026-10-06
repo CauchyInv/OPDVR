@@ -2551,6 +2551,33 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         return DataProto.from_dict(rm_inputs)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
+    def generate_teacher_suffixes(self, data: DataProto):
+        """Called only after student rollout sleeps; all IPC payloads are CPU objects."""
+        import numpy as np
+
+        from verl.workers.rollout.teacher_continuation import TeacherContinuationClient
+
+        if not hasattr(self, "_teacher_continuation"):
+            config = dict(data.meta_info["teacher_engine_config"])
+            config["seed"] += self.rank
+            config["cache_dir"] = os.path.join(config["cache_dir"], f"rank_{self.rank}")
+            self._teacher_continuation = TeacherContinuationClient(config, torch.cuda.current_device(), self.rank)
+        response = self._teacher_continuation.generate(data.non_tensor_batch["teacher_requests"].tolist())
+        size = len(response["results"])
+        return DataProto.from_dict(
+            tensors={"teacher_seconds": torch.full((size,), response["seconds"], dtype=torch.float64),
+                     "teacher_gpu_used_gib": torch.full((size,), response["gpu_used_gib"]),
+                     "teacher_gpu_free_gib": torch.full((size,), response["gpu_free_gib"])},
+            non_tensors={"teacher_results": np.array(response["results"], dtype=object)},
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def close_teacher_continuation(self):
+        if hasattr(self, "_teacher_continuation"):
+            self._teacher_continuation.close()
+        return True
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
     @DistProfiler.annotate(color="brown")
     def compute_rm_score(self, data: DataProto, kl_estimator="k1"):
         import itertools
@@ -2568,6 +2595,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         if "student_top_k_ids" in data.batch.keys():
              student_top_k_ids = data.batch["student_top_k_ids"]
              student_top_k_log_probs = data.batch["student_top_k_log_probs"]
+        auxiliary_topk = int(data.meta_info.get("disturbed_teacher_topk", 0))
+        if auxiliary_topk:
+            if student_top_k_ids is not None:
+                raise ValueError("Disturbed distribution repair requires sampled-token OPD, not top-K reward")
+            # Reuse the teacher's chunked top-K gather with a single sampled ID.
+            # This field is local to rm_data; no student-top-K reward is enabled.
+            student_top_k_ids = data.batch["responses"].unsqueeze(-1)
         
         # Get global_steps from meta_info
         global_steps = data.meta_info.get("global_steps", -1)
@@ -2640,7 +2674,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                     micro_batch, 
                     student_top_k_ids=mb_top_k_ids,
                     compute_entropy=compute_entropy,
-                    top_k=top_k,
+                    top_k=max(top_k, auxiliary_topk),
                     strategy=top_k_strategy,
                     teacher_temperature=teacher_temperature
                 )

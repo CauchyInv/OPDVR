@@ -353,6 +353,18 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self.takeover = None
+        if self.config.algorithm.get("teacher_takeover", {}).get("enabled", False):
+            from verl.trainer.ppo.takeover_controller import TakeoverController
+
+            self.takeover = TakeoverController(self)
+        # Probe-and-reweight OPD needs no rollout mixing, so it only validates the
+        # actor-side constraints here and rides the normal batch through the actor.
+        self.disturbed_opd = None
+        if self.config.algorithm.get("disturbed_opd", {}).get("enabled", False):
+            from verl.trainer.ppo.disturbed_opd import validate_disturbed_opd_training
+
+            self.disturbed_opd = validate_disturbed_opd_training(self.config).as_dict()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -478,9 +490,22 @@ class RayPPOTrainer:
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            response_mask = batch.batch["response_mask"].bool().cpu()
+            response_ids = batch.batch["responses"].cpu()
+            prompt_ids = batch.batch["prompts"].cpu()
+            prompt_mask = batch.batch["attention_mask"][:, : prompt_ids.shape[1]].bool().cpu()
+            prompt_token_ids = [prompt_ids[i][prompt_mask[i]].tolist() for i in range(prompt_ids.shape[0])]
+            response_token_ids = [
+                response_ids[i][response_mask[i]].tolist() for i in range(response_ids.shape[0])
+            ]
+            response_lengths = response_mask.sum(-1).tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            reward_extra_infos_to_dump["audit_response_id"] = list(range(len(outputs)))
+            reward_extra_infos_to_dump["prompt_token_ids"] = prompt_token_ids
+            reward_extra_infos_to_dump["response_token_ids"] = response_token_ids
+            reward_extra_infos_to_dump["response_length"] = response_lengths
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
                     "request_id",
@@ -548,6 +573,8 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_response_token_ids = []
+        sample_response_lengths = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -610,6 +637,14 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            if "response_mask" in test_output_gen_batch.batch:
+                output_mask = test_output_gen_batch.batch["response_mask"].bool()
+            else:
+                output_mask = output_ids.ne(self.tokenizer.pad_token_id)
+            sample_response_token_ids.extend(
+                output_ids[i][output_mask[i]].cpu().tolist() for i in range(output_ids.shape[0])
+            )
+            sample_response_lengths.extend(output_mask.sum(-1).cpu().tolist())
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -638,6 +673,9 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            reward_extra_infos_dict["uid"] = [str(value) for value in sample_uids]
+            reward_extra_infos_dict["response_token_ids"] = sample_response_token_ids
+            reward_extra_infos_dict["response_length"] = sample_response_lengths
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -837,6 +875,8 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        if self.takeover is not None:
+            self.takeover.save_state(local_global_step_folder, self.global_steps)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
@@ -880,6 +920,8 @@ class RayPPOTrainer:
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
+        if self.takeover is not None:
+            self.takeover.load_state(global_step_folder, self.global_steps)
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
@@ -986,6 +1028,9 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        if self.takeover is not None and self.global_steps >= self.total_training_steps:
+            print("Takeover checkpoint already completed the planned updates; no extra optimizer step.")
+            return
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1092,6 +1137,9 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+                    if self.takeover is not None:
+                        with marked_timer("teacher_continuation", timing_raw):
+                            batch = self.takeover.prepare(batch, self.global_steps, metrics)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1130,6 +1178,21 @@ class RayPPOTrainer:
                             batch.meta_info["kl_estimator"] = kl_estimator
                             batch.meta_info["reward_weight_mode"] = reward_weight_mode
                             batch.meta_info["teacher_temperature"] = teacher_temperature
+                            # Auxiliary teacher support must NOT switch the OPD
+                            # reward away from sampled-token teacher-student log ratio.
+                            if self.disturbed_opd:
+                                auxiliary_topk = 0
+                                if self.disturbed_opd.get("method") in (
+                                    "distribution_repair",
+                                    "sign_hybrid",
+                                ):
+                                    auxiliary_topk = int(self.disturbed_opd["teacher_topk"])
+                                auxiliary_topk = max(
+                                    auxiliary_topk,
+                                    int(self.disturbed_opd.get("audit_distribution_kl_topk", 0)),
+                                )
+                                if auxiliary_topk:
+                                    batch.meta_info["disturbed_teacher_topk"] = auxiliary_topk
                             
                             with marked_timer("compute_rm_score", timing_raw, color="magenta"):
                                 teacher_data = self.rm_wg.compute_rm_score(batch)
@@ -1459,6 +1522,9 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
  
+
+                        if self.takeover is not None:
+                            self.takeover.finalize(batch, metrics)
 
                         # --- Top-K Metrics Analysis (Chunked) ---
                         if "overlap_mask" in batch.batch.keys() and "advantages" in batch.batch.keys():
@@ -2312,6 +2378,18 @@ class RayPPOTrainer:
                         "teacher_in_student_mask",
                         "student_log_probs_on_teacher_ids",
                     ]
+                    # distribution_repair keeps sampled-token OPD as its base
+                    # objective, but needs the teacher's auxiliary top-K support
+                    # during the actor update.  The reward worker deliberately
+                    # emits these tensors without switching rm_scores to a
+                    # top-K reward, so do not discard them as legacy scratch.
+                    if self.disturbed_opd and (
+                        self.disturbed_opd.get("method") in ("distribution_repair", "sign_hybrid")
+                        or int(self.disturbed_opd.get("audit_distribution_kl_topk", 0)) > 0
+                    ):
+                        keys_to_pop.remove("teacher_top_k_ids")
+                        keys_to_pop.remove("teacher_top_k_log_probs")
+                        keys_to_pop.remove("teacher_entropy")
                     for key in keys_to_pop:
                         if key in batch.batch.keys():
                             batch.batch.pop(key)
@@ -2328,11 +2406,22 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            if self.disturbed_opd is not None:
+                                batch.meta_info["disturbed_opd"] = self.disturbed_opd
+                                if self.disturbed_opd.get("audit_dir", ""):
+                                    batch.batch["audit_response_id"] = torch.arange(
+                                        batch.batch.batch_size[0],
+                                        device=batch.batch["responses"].device,
+                                        dtype=torch.int64,
+                                    )
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
+                    if self.takeover is not None:
+                        with marked_timer("takeover_dump", timing_raw):
+                            self.takeover.dump(batch, self.global_steps, metrics)
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)

@@ -376,7 +376,13 @@ class vLLMRollout(BaseRollout):
             }
         elif is_validate:
             # Get max_tokens from val_kwargs, use response_length as fallback if None
-            val_max_tokens = self.config.val_kwargs.get("max_tokens", self.config.response_length)
+            # OmegaConf contains ``max_tokens: null`` by default.  ``dict.get``
+            # therefore returns None instead of the fallback, which makes each
+            # data-parallel worker pad to its own local longest response.  The
+            # worker outputs then have different widths and cannot be gathered
+            # with DataProto.concat.  Use the configured response length when
+            # validation does not explicitly set a limit, just like training.
+            val_max_tokens = self.config.val_kwargs.get("max_tokens", None) or self.config.response_length
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
@@ -395,7 +401,7 @@ class vLLMRollout(BaseRollout):
         # Determine the max_length for padding: use val_kwargs.max_tokens if in validation mode and set,
         # otherwise use response_length
         if is_validate:
-            val_max_tokens = self.config.val_kwargs.get("max_tokens", self.config.response_length)
+            val_max_tokens = self.config.val_kwargs.get("max_tokens", None) or self.config.response_length
             padding_max_length = val_max_tokens
         else:
             padding_max_length = self.config.response_length

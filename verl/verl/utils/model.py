@@ -33,7 +33,6 @@ from transformers import (
     AutoModelForTokenClassification,
     AutoModelForVision2Seq,
     GenerationConfig,
-    MistralForSequenceClassification,
     PretrainedConfig,
     PreTrainedModel,
 )
@@ -426,6 +425,9 @@ def _load_hf_model(config, model_config, is_value_model):
         warnings.simplefilter("ignore")
         # TODO: to find a better way to load mistral7b-rm lm_head
         if "mistral7b-rm" in config.model.path:
+            # lazy import: removed from transformers top-level namespace in 4.56
+            from transformers import MistralForSequenceClassification
+
             model = MistralForSequenceClassification.from_pretrained(
                 local_model_path,
                 torch_dtype="auto",
@@ -617,14 +619,22 @@ def patch_valuehead_model(model) -> None:
 
 
 def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+    import os
     from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+
+    # Respect the model config's attention backend.  The previous hard-coded
+    # flash_attention_2 path is not compatible with the installed H20 kernel
+    # image; SDPA/eager are valid fallbacks for debugging and portability.
+    attn_implementation = os.environ.get(
+        "VERL_VALUEHEAD_ATTN", getattr(model_config, "_attn_implementation", "sdpa") or "sdpa"
+    )
 
     try:
         model = AutoModelForTokenClassification.from_pretrained(
             pretrained_model_name_or_path=local_path,
             torch_dtype=torch_dtype,
             config=model_config,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             trust_remote_code=trust_remote_code,
         )
         return model
@@ -646,7 +656,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
         pretrained_model_name_or_path=local_path,
         torch_dtype=torch_dtype,
         config=model_config,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_implementation,
         trust_remote_code=trust_remote_code,
     )
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)

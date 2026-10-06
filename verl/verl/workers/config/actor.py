@@ -108,6 +108,9 @@ class ActorConfig(BaseConfig):
     entropy_coeff: float = 0
     use_kl_loss: bool = False
     use_torch_compile: bool = True
+    # Training forward autocast.  bf16 is the production default; fp32 is
+    # reserved for paired numerical audits with FSDP param_dtype=fp32.
+    forward_autocast_dtype: str = "bf16"
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
@@ -125,6 +128,8 @@ class ActorConfig(BaseConfig):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
+        if self.forward_autocast_dtype not in ("bf16", "fp32"):
+            raise ValueError("forward_autocast_dtype must be bf16 or fp32")
         if not self.use_dynamic_bsz:
             if self.ppo_micro_batch_size is not None and self.ppo_micro_batch_size_per_gpu is not None:
                 raise ValueError(

@@ -81,6 +81,10 @@ use_kl_loss: false
 # oc.select: the default val for ref.use_torch_compile
 use_torch_compile: true
 
+# Training forward autocast precision. fp32 is intended only for numerical
+# audits and must be paired with FSDP mixed_precision.param_dtype=fp32.
+forward_autocast_dtype: bf16
+
 # KL loss coefficient when use_kl_loss is enabled. For GRPO
 kl_loss_coef: 0.001
 

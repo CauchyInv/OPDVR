@@ -68,6 +68,13 @@ class Tracking:
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+            # Model/Ray startup can take longer than W&B's 90s default. Keep
+            # online logging enabled while allowing the timeout to be tuned
+            # from the launch environment.
+            init_timeout = os.environ.get("WANDB_INIT_TIMEOUT")
+            if init_timeout:
+                settings = settings or wandb.Settings()
+                settings.init_timeout = int(init_timeout)
             entity = os.environ.get("WANDB_ENTITY", None)
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
             self.logger["wandb"] = wandb
